@@ -162,11 +162,20 @@ cleanup_snapd() {
     systemctl stop snapd.service snapd.socket snapd.seeded.service 2>/dev/null || true
     systemctl disable snapd.service snapd.socket snapd.seeded.service 2>/dev/null || true
 
-    if dpkg -l | grep -q "^ii  snapd "; then
-        apt-get purge -y snapd
+    mount | awk '/\/snap\// {print $3}' | sort -r | xargs -r -n1 umount -l 2>/dev/null || true
+
+    if command -v snap >/dev/null 2>&1; then
+        snap list 2>/dev/null | awk 'NR>1 {print $1}' | while read -r pkg; do
+            [ -n "$pkg" ] && snap remove "$pkg" 2>/dev/null || true
+        done
     fi
 
-    rm -rf /snap /var/snap /var/lib/snapd /var/cache/snapd /root/snap
+    apt-get purge -y snapd 2>/dev/null || true
+    apt-get autoremove -y --purge 2>/dev/null || true
+
+    mount | awk '/\/snap\// {print $3}' | sort -r | xargs -r -n1 umount -l 2>/dev/null || true
+
+    rm -rf /snap /var/snap /var/lib/snapd /var/cache/snapd /root/snap 2>/dev/null || true
     find /home -maxdepth 2 -type d -name snap -exec rm -rf {} + 2>/dev/null || true
 }
 
