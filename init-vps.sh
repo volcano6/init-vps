@@ -420,6 +420,224 @@ setup_tg_env() {
     log_info "Telegram 配置已写入 /etc/tg.env"
 }
 
+
+# ===== 服务器压力监控 =====
+setup_resource_monitor_tg() {
+  if [[ ! -f /etc/tg.env ]]; then
+    log_info "未检测到 /etc/tg.env，跳过 TG 资源告警配置。"
+    return
+  fi
+
+  log_info "配置 TG 资源告警监控..."
+
+  install -d -m 0755 /usr/local/bin
+  install -d -m 0755 /var/lib/resource-monitor
+
+  cat > /usr/local/bin/resource-monitor-tg.sh <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+STATE_DIR="/var/lib/resource-monitor"
+CPU_HISTORY_FILE="${STATE_DIR}/cpu_history"
+MEM_HISTORY_FILE="${STATE_DIR}/mem_history"
+ALERT_STATE_FILE="${STATE_DIR}/alert_state"
+
+CPU_THRESHOLD=50
+MEM_THRESHOLD=80
+WINDOW_MINUTES=30
+INTERVAL_MINUTES=5
+
+mkdir -p "${STATE_DIR}"
+
+[[ -f /etc/tg.env ]] || exit 0
+# shellcheck disable=SC1091
+source /etc/tg.env
+
+TG_BOT_TOKEN="${TG_VLESS:-}"
+TG_CHAT_ID="${TG_CHAT_ID:-}"
+
+[[ -n "${TG_BOT_TOKEN}" && -n "${TG_CHAT_ID}" ]] || exit 0
+
+HOSTNAME_F="$(hostname -f 2>/dev/null || hostname)"
+PUBLIC_IP="$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || echo "unknown")"
+
+send_tg() {
+  local text="$1"
+  curl -fsS --max-time 15 \
+    -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+    -d "chat_id=${TG_CHAT_ID}" \
+    --data-urlencode "text=${text}" \
+    -d "parse_mode=HTML" >/dev/null || true
+}
+
+get_cpu_usage_percent() {
+  local cpu1 cpu2 idle1 idle2 total1 total2 usage
+  read -r _ user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
+  idle1=$((idle + iowait))
+  total1=$((user + nice + system + idle + iowait + irq + softirq + steal))
+  sleep 1
+  read -r _ user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
+  idle2=$((idle + iowait))
+  total2=$((user + nice + system + idle + iowait + irq + softirq + steal))
+
+  if (( total2 <= total1 )); then
+    echo 0
+    return
+  fi
+
+  usage=$(awk -v t1="${total1}" -v t2="${total2}" -v i1="${idle1}" -v i2="${idle2}" \
+    'BEGIN { printf "%.0f", (1 - (i2-i1)/(t2-t1)) * 100 }')
+  echo "${usage}"
+}
+
+get_mem_usage_percent() {
+  local total avail
+  total="$(awk '/MemTotal:/ {print $2}' /proc/meminfo)"
+  avail="$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)"
+
+  if [[ -z "${total}" || -z "${avail}" || "${total}" -eq 0 ]]; then
+    echo 0
+    return
+  fi
+
+  awk -v total="${total}" -v avail="${avail}" 'BEGIN { printf "%.0f", ((total-avail)/total)*100 }'
+}
+
+trim_history() {
+  local file="$1"
+  local keep_lines="$2"
+  touch "${file}"
+  tail -n "${keep_lines}" "${file}" > "${file}.tmp" 2>/dev/null || true
+  mv "${file}.tmp" "${file}"
+}
+
+all_lines_ge_threshold() {
+  local file="$1"
+  local threshold="$2"
+  local required="$3"
+
+  [[ -f "${file}" ]] || return 1
+  local count
+  count="$(wc -l < "${file}")"
+  (( count >= required )) || return 1
+
+  tail -n "${required}" "${file}" | awk -v th="${threshold}" '
+    { if ($1+0 < th) exit 1 }
+    END { exit 0 }
+  '
+}
+
+get_state() {
+  local key="$1"
+  [[ -f "${ALERT_STATE_FILE}" ]] || { echo 0; return; }
+  awk -F= -v k="${key}" '$1==k {print $2}' "${ALERT_STATE_FILE}" | tail -n1
+}
+
+set_state() {
+  local key="$1"
+  local value="$2"
+  touch "${ALERT_STATE_FILE}"
+  if grep -q "^${key}=" "${ALERT_STATE_FILE}" 2>/dev/null; then
+    sed -i "s/^${key}=.*/${key}=${value}/" "${ALERT_STATE_FILE}"
+  else
+    echo "${key}=${value}" >> "${ALERT_STATE_FILE}"
+  fi
+}
+
+CPU_USAGE="$(get_cpu_usage_percent)"
+MEM_USAGE="$(get_mem_usage_percent)"
+
+REQUIRED_SAMPLES=$((WINDOW_MINUTES / INTERVAL_MINUTES))
+(( REQUIRED_SAMPLES < 1 )) && REQUIRED_SAMPLES=1
+
+echo "${CPU_USAGE}" >> "${CPU_HISTORY_FILE}"
+echo "${MEM_USAGE}" >> "${MEM_HISTORY_FILE}"
+
+trim_history "${CPU_HISTORY_FILE}" "${REQUIRED_SAMPLES}"
+trim_history "${MEM_HISTORY_FILE}" "${REQUIRED_SAMPLES}"
+
+CPU_ALERTED="$(get_state cpu_alerted)"
+MEM_ALERTED="$(get_state mem_alerted)"
+
+CPU_HIGH=0
+MEM_HIGH=0
+
+all_lines_ge_threshold "${CPU_HISTORY_FILE}" "${CPU_THRESHOLD}" "${REQUIRED_SAMPLES}" && CPU_HIGH=1
+all_lines_ge_threshold "${MEM_HISTORY_FILE}" "${MEM_THRESHOLD}" "${REQUIRED_SAMPLES}" && MEM_HIGH=1
+
+NOW_TIME="$(date '+%F %T %Z')"
+
+if (( CPU_HIGH == 1 )) && (( CPU_ALERTED == 0 )); then
+  send_tg "🚨 <b>VPS CPU 告警</b>
+主机: <code>${HOSTNAME_F}</code>
+IP: <code>${PUBLIC_IP}</code>
+时间: <code>${NOW_TIME}</code>
+条件: CPU 连续 ${WINDOW_MINUTES} 分钟 ≥ ${CPU_THRESHOLD}%
+当前: <code>${CPU_USAGE}%</code>"
+  set_state cpu_alerted 1
+fi
+
+if (( MEM_HIGH == 1 )) && (( MEM_ALERTED == 0 )); then
+  send_tg "🚨 <b>VPS 内存告警</b>
+主机: <code>${HOSTNAME_F}</code>
+IP: <code>${PUBLIC_IP}</code>
+时间: <code>${NOW_TIME}</code>
+条件: 内存连续 ${WINDOW_MINUTES} 分钟 ≥ ${MEM_THRESHOLD}%
+当前: <code>${MEM_USAGE}%</code>"
+  set_state mem_alerted 1
+fi
+
+if (( CPU_HIGH == 0 )) && (( CPU_ALERTED == 1 )); then
+  send_tg "✅ <b>VPS CPU 恢复</b>
+主机: <code>${HOSTNAME_F}</code>
+IP: <code>${PUBLIC_IP}</code>
+时间: <code>${NOW_TIME}</code>
+当前: <code>${CPU_USAGE}%</code>"
+  set_state cpu_alerted 0
+fi
+
+if (( MEM_HIGH == 0 )) && (( MEM_ALERTED == 1 )); then
+  send_tg "✅ <b>VPS 内存恢复</b>
+主机: <code>${HOSTNAME_F}</code>
+IP: <code>${PUBLIC_IP}</code>
+时间: <code>${NOW_TIME}</code>
+当前: <code>${MEM_USAGE}%</code>"
+  set_state mem_alerted 0
+fi
+EOF
+
+  chmod +x /usr/local/bin/resource-monitor-tg.sh
+
+  cat > /etc/systemd/system/resource-monitor-tg.service <<'EOF'
+[Unit]
+Description=Resource Monitor Telegram Alert
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/resource-monitor-tg.sh
+User=root
+EOF
+
+  cat > /etc/systemd/system/resource-monitor-tg.timer <<'EOF'
+[Unit]
+Description=Run Resource Monitor Telegram Alert every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=resource-monitor-tg.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now resource-monitor-tg.timer
+
+  log_info "TG 资源告警已配置完成（TG_VLESS + TG_CHAT_ID）。"
+}
+
 # ===== 清理 =====
 final_cleanup() {
     log_info "执行系统清理..."
@@ -463,6 +681,7 @@ main() {
     setup_bbr
     setup_user_and_ssh_key
     setup_tg_env
+    setup_resource_monitor_tg
     install_docker_official
     harden_ssh_and_fail2ban
     final_cleanup
