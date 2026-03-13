@@ -265,8 +265,6 @@ install_base_tools() {
     jq \
     git \
     unzip \
-    software-properties-common \
-    apt-transport-https \
     fail2ban \
     openssh-server
 }
