@@ -17,7 +17,7 @@ Ubuntu 22.04 / 24.04 VPS 初始化脚本。
 ## 交互使用
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/你的用户名/你的仓库/main/init-vps.sh -o init-vps.sh
+curl -fsSL https://raw.githubusercontent.com/volcano6/init-vps/main/init-vps.sh -o init-vps.sh
 chmod +x init-vps.sh
 sudo bash init-vps.sh
 ```
