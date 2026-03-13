@@ -17,7 +17,11 @@ Ubuntu 22.04 / 24.04 VPS 初始化脚本。
 ## 交互使用
 
 ```bash
+# 初始化脚本
 curl -fsSL https://raw.githubusercontent.com/volcano6/init-vps/main/init-vps.sh -o init-vps.sh
-chmod +x init-vps.sh
 sudo bash init-vps.sh
+
+# 初始化vless
+curl -fsSL https://raw.githubusercontent.com/volcano6/init-vps/main/vless.sh -o vless.sh
+sudo bash vless.sh
 ```

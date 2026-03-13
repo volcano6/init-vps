@@ -367,6 +367,59 @@ EOF
     log_info "SSH 配置已应用。"
 }
 
+# ===== 写入tg配置 =====
+setup_tg_env() {
+    local tg_url=""
+    local tmp_file=""
+
+    if [[ -f /etc/tg.env ]]; then
+        chmod 644 /etc/tg.env 2>/dev/null || true
+        log_info "检测到 /etc/tg.env 已存在，跳过 Telegram 配置拉取。"
+        return
+    fi
+
+    read -r -p "👉 5. 请输入 Telegram 配置地址(如 https://xxx?token=1，直接回车跳过): " tg_url
+
+    if [[ -z "${tg_url}" ]]; then
+        log_info "未提供 Telegram 配置地址，跳过。"
+        return
+    fi
+
+    tmp_file="$(mktemp)"
+
+    log_info "正在拉取 Telegram 配置..."
+    if ! curl -fsSL "${tg_url}" -o "${tmp_file}"; then
+        rm -f "${tmp_file}"
+        log_warn "Telegram 配置拉取失败，已跳过。"
+        return
+    fi
+
+    # 必须包含 TG_CHAT_ID
+    grep -Eq '^TG_CHAT_ID=".*"$' "${tmp_file}" || {
+        rm -f "${tmp_file}"
+        log_warn "Telegram 配置缺少 TG_CHAT_ID，已跳过。"
+        return
+    }
+
+    # 至少要有一个 TG_XXX
+    grep -Eq '^TG_[A-Z0-9_]+=".*"$' "${tmp_file}" || {
+        rm -f "${tmp_file}"
+        log_warn "Telegram 配置格式无效，已跳过。"
+        return
+    }
+
+    # 只允许 TG_XXX="..." 这种行
+    if grep -Ev '^(TG_[A-Z0-9_]+)=".*"$' "${tmp_file}" >/dev/null 2>&1; then
+        rm -f "${tmp_file}"
+        log_warn "Telegram 配置包含不安全内容，已拒绝写入。"
+        return
+    fi
+
+    mv "${tmp_file}" /etc/tg.env
+    chmod 644 /etc/tg.env
+    log_info "Telegram 配置已写入 /etc/tg.env"
+}
+
 # ===== 清理 =====
 final_cleanup() {
     log_info "执行系统清理..."
@@ -409,6 +462,7 @@ main() {
     setup_swap
     setup_bbr
     setup_user_and_ssh_key
+    setup_tg_env
     install_docker_official
     harden_ssh_and_fail2ban
     final_cleanup
